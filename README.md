@@ -1,4 +1,4 @@
-# -spotify-media-library-management-system
+# spotify-media-library-management-system
 
 Automatically creates and updates a playlist with your current top tracks on Spotify.
 
