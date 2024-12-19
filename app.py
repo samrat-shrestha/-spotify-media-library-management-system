@@ -8,6 +8,8 @@ from spotipy.oauth2 import SpotifyOAuth
 from flask import Flask, request, url_for, session, redirect
 from dotenv import load_dotenv
 import logging
+from openai import OpenAI
+import json
 
 # Load environment variables
 load_dotenv()
@@ -31,6 +33,9 @@ SPOTIFY_CLIENT_ID = os.getenv('SPOTIFY_CLIENT_ID')
 SPOTIFY_CLIENT_SECRET = os.getenv('SPOTIFY_CLIENT_SECRET')
 SPOTIFY_REDIRECT_URI = os.getenv('SPOTIFY_REDIRECT_URI')
 SPOTIFY_SCOPE = 'user-library-read user-top-read playlist-modify-public playlist-modify-private'
+
+#OpenAI Configuration
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 
 def login_required(f):
     @wraps(f)
@@ -129,6 +134,111 @@ def logout():
     except Exception as e:
         logger.error(f"Error during logout: {str(e)}")
         return "An error occurred during logout", 500
+    
+@app.route('/generate')
+def generate():
+    try:
+        # Get Spotify tracks
+        token_info = get_token()
+        sp = spotipy.Spotify(auth=token_info['access_token'])
+        
+        # Fetch user's top tracks
+        top_tracks = sp.current_user_top_tracks(limit=20)['items']
+        
+        # Create a formatted list of track and artist information
+        tracks_info = []
+        for track in top_tracks:
+            artists = ", ".join([artist['name'] for artist in track['artists']])
+            track_info = f"{track['name']} by {artists}"
+            tracks_info.append(track_info)
+        
+        # Format tracks for OpenAI prompt
+        tracks_string = "\n".join(tracks_info)
+        
+        # Initialize OpenAI client
+        client = OpenAI(api_key=OPENAI_API_KEY)
+        
+        # Make API call to OpenAI
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are a helpful music expert analyzing someone's top tracks. You must respond only with valid JSON containing song recommendations in the format: [{'song': 'Song Name', 'artist': 'Artist Name'}, ...]. Do not include any additional text or markdown formatting."},
+                {"role": "user", "content": f"Based on these tracks, generate 10 song recommendations:\n\n{tracks_string}"}
+            ],
+            max_tokens=500,
+            temperature=0.7
+        )
+        
+        # Extract the response
+        ai_response = response.choices[0].message.content
+        
+        # Parse the JSON response
+        recommended_songs = json.loads(ai_response)
+        
+        # Get current user's playlists
+        current_user_id = sp.current_user()['id']
+        playlists = sp.current_user_playlists()
+        playlist_id = None
+        
+        # Check if "Similar Songs Weekly" already exists
+        for playlist in playlists['items']:
+            if playlist['name'] == "Similar Songs Weekly":
+                playlist_id = playlist['id']
+                break
+        
+        # print("PLAYLIST:",playlist_id)
+        # Create new playlist if it doesn't exist
+        if not playlist_id:
+            playlist = sp.user_playlist_create(
+                user=current_user_id,
+                name="Similar Songs Weekly",
+                public=True,
+                description="AI-generated recommendations based on your top tracks"
+            )
+            playlist_id = playlist['id']
+            playlist_url = playlist['external_urls']['spotify']
+        else:
+            playlist = sp.playlist(playlist_id)
+            playlist_url = playlist['external_urls']['spotify']
+            sp.playlist_replace_items(playlist_id, [])
+        
+        # Search and add each recommended song
+        track_uris = []
+        for index, song in enumerate(recommended_songs, 1):
+            search_query = f"track:{song['song']} artist:{song['artist']}"
+            logger.info(f"[{index}/10] Searching for: {song['song']} by {song['artist']}")
+            
+            search_results = sp.search(q=search_query, type='track', limit=1)
+            
+            if search_results['tracks']['items']:
+                track_uri = search_results['tracks']['items'][0]['uri']
+                track_name = search_results['tracks']['items'][0]['name']
+                artist_name = search_results['tracks']['items'][0]['artists'][0]['name']
+                track_uris.append(track_uri)
+                logger.info(f"✓ Found track: {track_name} by {artist_name}")
+            else:
+                logger.warning(f"✗ Could not find: {song['song']} by {song['artist']}")
+        
+        # Add all found tracks to the playlist
+        if track_uris:
+            logger.info(f"Adding {len(track_uris)} tracks to playlist 'Similar Songs Weekly'")
+            sp.playlist_add_items(playlist_id, track_uris)
+            logger.info("Successfully added tracks to playlist")
+        else:
+            logger.warning("No tracks were found to add to the playlist")
+        
+        return {
+            "similar_songs": ai_response,
+            "playlist_id": playlist_id,
+            "playlist_url": playlist_url
+        }, 200
+        
+    except json.JSONDecodeError as e:
+        logger.error(f"Error parsing AI response: {str(e)}")
+        return "Invalid response format from AI", 500
+    except Exception as e:
+        logger.error(f"Error generating track list: {str(e)}")
+        return "An error occurred while generating track list", 500
 
 def get_token() -> Optional[Dict]:
     """Get and refresh token if necessary."""
